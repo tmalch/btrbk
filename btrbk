@@ -45,6 +45,8 @@ use warnings FATAL => qw( all );
 use Carp qw(confess);
 use Date::Calc qw(Today Delta_Days Day_of_Week);
 use Getopt::Std;
+use IPC::Open3;
+use IO::Select;
 use Data::Dumper;
 
 our $VERSION       = "0.19.3";
@@ -156,49 +158,121 @@ sub WARN  { my $t = shift; print STDERR "WARNING: $t\n" if($loglevel >= 1);  }
 sub ERROR { my $t = shift; print STDERR "ERROR: $t\n";  }
 
 
-sub run_cmd($;@)
+sub run_cmd
 {
-  my $cmd = shift || die;
-  my %opts = @_;
-  my $ret = "";
-  $cmd =~ s/^\s+//;
-  $cmd =~ s/\s+$//;
-  $cmd .= ' 2>&1' if($opts{catch_stderr});
+  my %args = @_;
   $err = "";
-  if($opts{non_destructive} || (not $dryrun)) {
-    DEBUG "### $cmd";
-    $ret = `$cmd`;
-    chomp($ret);
-    TRACE "Command output:\n$ret";
-    if($?) {
-      my $exitcode= $? >> 8;
-      my $signal = $? & 127;
-      DEBUG "Command execution failed (exitcode=$exitcode" . ($signal ? ", signal=$signal" : "") . "): \"$cmd\"";
 
-      if($opts{catch_stderr}) {
-        if($ret =~ /ssh command rejected/) {
-          # catch errors from ssh_filter_btrbk.sh
-          $err = "ssh command rejected (please fix ssh_filter_btrbk.sh)";
-        }
-        elsif($ret =~ /^ERROR: (.*)/) {
-          # catch errors from btrfs command
-          $err = $1;
-        }
-        else {
-          DEBUG "Unparseable error: $ret";
-          $err = "unparseable error";
-        }
+  $args{rsh} //= [];
+  my @left_cmd  = ( @{$args{rsh}}, @{$args{cmd}} );
+  my $stdout_filter = $args{filter_stdout};
+  my $left_stderr_filter = $args{filter_stderr};
+  my $left_name = $args{name} || join(' ', @left_cmd);
+
+  my $pipe = $args{pipe};
+  my $right_stderr_filter;
+  my $right_name;
+  my @right_cmd;
+  if($pipe) {
+    my $right_rsh = $pipe->{rsh} // [];
+    @right_cmd = ( @$right_rsh, @{$pipe->{cmd}} );
+    $right_stderr_filter = $pipe->{filter_stderr};
+    $right_name = $pipe->{name} || join(' ', @right_cmd);
+  }
+
+  my $cmd_text = join(' ', @left_cmd);
+  $cmd_text .= ' | ' . join(' ', @right_cmd) if($pipe);
+
+  if($dryrun && (not $args{non_destructive})) {
+    DEBUG "### (dryrun) $cmd_text";
+    return "";
+  }
+
+  DEBUG "### $cmd_text";
+
+  my $left_pid = open3(\*LEFT_IN, \*LEFT_OUT, \*LEFT_ERR, @left_cmd) || die "failed to fork LEFT child: $!";
+  TRACE "open3 left: pid=$left_pid, in=" . fileno(LEFT_IN) . ", out=" . fileno(LEFT_OUT) . ", err=" . fileno(LEFT_ERR) . ", cmd='@left_cmd'";
+  close(LEFT_IN) || die("failed to close LEFT_IN: $!\n");
+
+  my $fh_out  = \*LEFT_OUT;
+  my $fh_lerr = \*LEFT_ERR;
+  my $fh_rerr = undef;
+  my $right_pid = undef;
+
+  if($pipe)
+  {
+    # NOTE: LEFT_OUT is closed in parent, and child will read from it directly (because of "<&" prefix)
+    $right_pid = open3('<&LEFT_OUT', \*RIGHT_OUT, \*RIGHT_ERR, @right_cmd) || die "failed to fork RIGHT child: $!";
+    TRACE "open3 right: pid=$right_pid, out=" . fileno(RIGHT_OUT) . ", err=" . fileno(RIGHT_ERR) . ", cmd='@right_cmd'";
+    $fh_out  = \*RIGHT_OUT;
+    $fh_rerr = \*RIGHT_ERR;
+  }
+
+  my $select = new IO::Select;
+  $select->add($fh_out, $fh_lerr);
+  $select->add($fh_rerr) if(defined($fh_rerr));
+
+  my $out = '';
+  while(my @fhs = $select->can_read) {
+    foreach my $fh (@fhs) {
+      my $line = <$fh>;  # line buffered input! for charbuf, use sysread()
+      unless(defined $line) {
+        $select->remove($fh);
+        next;
       }
-      return undef;
+      $_ = $line;
+      chomp;
+      if(fileno($fh) == fileno($fh_out)) {
+        $out .= $line;  # append unmodified line
+        &$stdout_filter if($stdout_filter);
+        TRACE $_ if($_);
+      } elsif(fileno($fh) == fileno($fh_lerr)) {
+        &$left_stderr_filter if($left_stderr_filter);
+        ERROR "[$left_name] $_" if($_);
+      } elsif(defined($fh_rerr) && (fileno($fh) == fileno($fh_rerr))) {
+        &$right_stderr_filter if($right_stderr_filter);
+        ERROR "[$right_name] $_" if($_);
+      } else {
+        die "unexpected filehandle from select()";
+      }
     }
-    else {
-      DEBUG "Command execution successful";
-    }
+  }
+
+  waitpid($left_pid, 0);
+  my $left_status = $?;
+  my $right_status = 0;
+  if($pipe) {
+    waitpid($right_pid, 0);
+    $right_status = $?;
+  }
+
+  close(LEFT_ERR) || die("le Return: $? | $@ | $!\n");
+  if($pipe) {
+    close(RIGHT_OUT) || die("ro Return: $? | $@ | $!\n");
+    close(RIGHT_ERR) || die("re Return: $? | $@ | $!\n");
   }
   else {
-    DEBUG "### (dryrun) $cmd";
+    close(LEFT_OUT) || die("lo Return: $? | $@ | $!\n");
   }
-  return $ret;
+
+
+  if($left_status || $right_status)
+  {
+    if($left_status) {
+      my $exitcode= $left_status >> 8;
+      my $signal = $left_status & 127;
+      DEBUG "Command execution failed (exitcode=$exitcode" . ($signal ? ", signal=$signal" : "") . "): \"@left_cmd\"";
+    }
+    if($right_status) {
+      my $exitcode= $right_status >> 8;
+      my $signal = $right_status & 127;
+      DEBUG "Command execution failed (exitcode=$exitcode" . ($signal ? ", signal=$signal" : "") . "): \"@right_cmd\"";
+    }
+    return undef;
+  }
+  DEBUG "Command execution successful";
+
+  return $out;
 }
 
 
@@ -218,9 +292,9 @@ sub vinfo($$)
     my ($host, $path) = ($1, $2);
     my $ssh_user      = config_key($config, "ssh_user");
     my $ssh_identity  = config_key($config, "ssh_identity");
-    my $ssh_options   = "";
+    my @ssh_options;
     if($ssh_identity) {
-      $ssh_options .= "-i $ssh_identity ";
+      @ssh_options = ('-i', $ssh_identity);
     }
     else {
       WARN "No SSH identity provided (option ssh_identity is not set) for: $url";
@@ -233,7 +307,7 @@ sub vinfo($$)
       RSH_TYPE     => "ssh",
       SSH_USER     => $ssh_user,
       SSH_IDENTITY => $ssh_identity,
-      RSH          => "/usr/bin/ssh $ssh_options" . $ssh_user . '@' . $host,
+      RSH          => ['/usr/bin/ssh', @ssh_options, $ssh_user . '@' . $host ],
      );
   }
   elsif(($url =~ /^\//) && ($url =~ /^$file_match$/)) {
@@ -586,7 +660,9 @@ sub parse_config(@)
 
 sub btrfs_filesystem_show_all_local()
 {
-  return run_cmd("btrfs filesystem show", non_destructive => 1);
+  return run_cmd( cmd => [ qw(btrfs filesystem show) ],
+                  non_destructive => 1
+                 );
 }
 
 
@@ -594,8 +670,10 @@ sub btrfs_filesystem_show($)
 {
   my $vol = shift || die;
   my $path = $vol->{PATH} // die;
-  my $rsh = $vol->{RSH} || "";
-  return run_cmd("$rsh btrfs filesystem show '$path'", non_destructive => 1);
+  return run_cmd( cmd => [ qw(btrfs filesystem show), $path ],
+                  rsh => $vol->{RSH},
+                  non_destructive => 1
+                 );
 }
 
 
@@ -603,8 +681,10 @@ sub btrfs_filesystem_df($)
 {
   my $vol = shift || die;
   my $path = $vol->{PATH} // die;
-  my $rsh = $vol->{RSH} || "";
-  return run_cmd("$rsh btrfs filesystem df '$path'", non_destructive => 1);
+  return run_cmd( cmd => [qw(btrfs filesystem df), $path],
+                  rsh => $vol->{RSH},
+                  non_destructive => 1
+                 );
 }
 
 
@@ -612,8 +692,10 @@ sub btrfs_filesystem_usage($)
 {
   my $vol = shift || die;
   my $path = $vol->{PATH} // die;
-  my $rsh = $vol->{RSH} || "";
-  return run_cmd("$rsh btrfs filesystem usage '$path'", non_destructive => 1);
+  return run_cmd( cmd => [ qw(btrfs filesystem usage), $path ],
+                  rsh => $vol->{RSH},
+                  non_destructive => 1
+                 );
 }
 
 
@@ -621,8 +703,26 @@ sub btrfs_subvolume_detail($)
 {
   my $vol = shift || die;
   my $path = $vol->{PATH} // die;
-  my $rsh = $vol->{RSH} || "";
-  my $ret = run_cmd("$rsh btrfs subvolume show '$path'", non_destructive => 1, catch_stderr => 1);
+  my $ret = run_cmd(cmd => [ qw(btrfs subvolume show), $path],
+                    rsh => $vol->{RSH},
+                    non_destructive => 1,
+                    filter_stderr => sub {
+                      if(/ssh command rejected/) {
+                        # catch errors from ssh_filter_btrbk.sh
+                        $err = "ssh command rejected (please fix ssh_filter_btrbk.sh)";
+                      }
+                      elsif(/^ERROR: (.*)/) {
+                        # catch errors from btrfs command
+                        $err = $1;
+                      }
+                      else {
+                        DEBUG "Unparsed error: $_";
+                        $err = $_;
+                      }
+                      # consume stderr line, as $err will be displayed as a user-friendly WARNING
+                      $_ = undef;
+                    }
+                   );
   return undef unless(defined($ret));
 
   # workaround for btrfs-progs < 3.17.3 (returns exit status 0 on errors)
@@ -643,7 +743,7 @@ sub btrfs_subvolume_detail($)
   }
   my %detail = ( REAL_PATH  => $real_path );
 
-  if($ret eq "$real_path is btrfs root") {
+  if($ret eq "$real_path is btrfs root\n") {
     DEBUG "found btrfs root: $vol->{PRINT}";
     $detail{id}      = 5;
     $detail{is_root} = 1;
@@ -690,13 +790,15 @@ sub btrfs_subvolume_list($;@)
   my $vol = shift || die;
   my %opts = @_;
   my $path = $vol->{PATH} // die;
-  my $rsh = $vol->{RSH} || "";
   my $btrfs_progs_compat = $vol->{BTRFS_PROGS_COMPAT} || $opts{btrfs_progs_compat};
-  my $filter_option = "-a";
-  $filter_option = "-o" if($opts{subvol_only});
-  my $display_options = "-c -u -q";
-  $display_options .= " -R" unless($btrfs_progs_compat);
-  my $ret = run_cmd("$rsh btrfs subvolume list $filter_option $display_options '$path'", non_destructive => 1);
+  my @filter_options = ('-a');
+  push(@filter_options, '-o') if($opts{subvol_only});
+  my @display_options = ('-c', '-u', '-q');
+  push(@display_options, '-R') unless($btrfs_progs_compat);
+  my $ret = run_cmd(cmd => [ qw(btrfs subvolume list), @filter_options, @display_options, $path ],
+                    rsh => $vol->{RSH},
+                    non_destructive => 1,
+                   );
   return undef unless(defined($ret));
 
   my @nodes;
@@ -754,9 +856,11 @@ sub btrfs_subvolume_find_new($$;$)
 {
   my $vol = shift || die;
   my $path = $vol->{PATH} // die;
-  my $rsh = $vol->{RSH} || "";
   my $lastgen = shift // die;
-  my $ret = run_cmd("$rsh btrfs subvolume find-new '$path' $lastgen", non_destructive => 1);
+  my $ret = run_cmd(cmd => [ qw(btrfs subvolume find-new), $path, $lastgen ],
+                    rsh => $vol->{RSH},
+                    non_destructive => 1,
+                   );
   unless(defined($ret)) {
     ERROR "Failed to fetch modified files for: $vol->{PRINT}";
     return undef;
@@ -813,13 +917,14 @@ sub btrfs_subvolume_snapshot($$)
   my $svol = shift || die;
   my $target_path = shift // die;
   my $src_path = $svol->{PATH} // die;
-  my $rsh = $svol->{RSH} || "";
   DEBUG "[btrfs] snapshot (ro):";
   DEBUG "[btrfs]   host  : $svol->{HOST}" if($svol->{HOST});
   DEBUG "[btrfs]   source: $src_path";
   DEBUG "[btrfs]   target: $target_path";
   INFO ">>> " . ($svol->{HOST} ? "{$svol->{HOST}}" : "") .  $target_path;
-  my $ret = run_cmd("$rsh btrfs subvolume snapshot -r '$src_path' '$target_path'");
+  my $ret = run_cmd(cmd => [ qw(btrfs subvolume snapshot), '-r', $src_path, $target_path ],
+                    rsh => $svol->{RSH},
+                   );
   ERROR "Failed to create btrfs subvolume snapshot: $svol->{PRINT} -> $target_path" unless(defined($ret));
   return defined($ret) ? $target_path : undef;
 }
@@ -833,17 +938,20 @@ sub btrfs_subvolume_delete($@)
   die if($commit && ($commit ne "after") && ($commit ne "each"));
   $targets = [ $targets ] unless(ref($targets) eq "ARRAY");
   return 0 unless(scalar(@$targets));
-  my $rsh = $targets->[0]->{RSH} || "";
+  my $rsh = $targets->[0]->{RSH};
+  my $rsh_host_check = $targets->[0]->{HOST} || "";
   foreach (@$targets) {
-    # make sure all targets share same RSH
-    my $rsh_check = $_->{RSH} || "";
-    die if($rsh ne $rsh_check);
+    # make sure all targets share same HOST
+    my $host = $_->{HOST} || "";
+    die if($rsh_host_check ne $host);
   }
   DEBUG "[btrfs] delete" . ($commit ? " (commit-$commit):" : ":");
   DEBUG "[btrfs]   subvolume: $_->{PRINT}" foreach(@$targets);
-  my $options = "";
-  $options = "--commit-$commit " if($commit);
-  my $ret = run_cmd("$rsh btrfs subvolume delete $options" . join(' ', map( { "'$_->{PATH}'" } @$targets)));
+  my @options;
+  @options = ("--commit-$commit") if($commit);
+  my $ret = run_cmd(cmd => [ qw(btrfs subvolume delete), @options,  map( { "'$_->{PATH}'" } @$targets) ],
+                    rsh => $rsh,
+                   );
   ERROR "Failed to delete btrfs subvolumes: " . join(' ', map( { $_->{PRINT} } @$targets)) unless(defined($ret));
   return defined($ret) ? scalar(@$targets) : undef;
 }
@@ -855,9 +963,9 @@ sub btrfs_send_receive($$$)
   my $target = shift || die;
   my $parent = shift;
   my $snapshot_path = $snapshot->{PATH} // die;
-  my $snapshot_rsh  = $snapshot->{RSH} || "";
+  my $snapshot_rsh  = $snapshot->{RSH};
   my $target_path = $target->{PATH} // die;
-  my $target_rsh  = $target->{RSH} || "";
+  my $target_rsh  = $target->{RSH};
   my $parent_path = $parent ? $parent->{PATH} : undef;
 
    my $snapshot_name = $snapshot_path;
@@ -869,11 +977,18 @@ sub btrfs_send_receive($$$)
   DEBUG "[btrfs]   parent: $parent->{PRINT}" if($parent);
   DEBUG "[btrfs]   target: $target->{PRINT}";
 
-  my $parent_option = $parent_path ? "-p '$parent_path'" : "";
-  my $receive_option = "";
-  $receive_option = "-v" if($loglevel >= 3);
+  my @parent_option;
+  my @receive_option;
+  @parent_option =  ('-p', $parent_path) if($parent_path);
+  @receive_option = ('-v') if($loglevel >= 3);
 
-  my $ret = run_cmd("$snapshot_rsh btrfs send $parent_option '$snapshot_path' | $target_rsh btrfs receive $receive_option '$target_path/'");
+  my $ret = run_cmd(cmd => [ qw(btrfs send), @parent_option, $snapshot_path ],
+                    rsh => $snapshot_rsh,
+                    pipe => {
+                      cmd => [ qw(btrfs receive), @receive_option, $target_path . '/' ],
+                      rsh => $target_rsh,
+                     },
+                   );
   unless(defined($ret)) {
     ERROR "Failed to send/receive btrfs subvolume: $snapshot->{PRINT} " . ($parent_path ? "[$parent_path]" : "") . " -> $target->{PRINT}";
     return undef;
