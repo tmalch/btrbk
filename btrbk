@@ -224,13 +224,13 @@ sub run_cmd
       chomp;
       if(fileno($fh) == fileno($fh_out)) {
         $out .= $line;  # append unmodified line
-        &$stdout_filter if($stdout_filter);
+        &$stdout_filter($right_name // $left_name) if($stdout_filter);
         TRACE $_ if($_);
       } elsif(fileno($fh) == fileno($fh_lerr)) {
-        &$left_stderr_filter if($left_stderr_filter);
+        &$left_stderr_filter($left_name) if($left_stderr_filter);
         ERROR "[$left_name] $_" if($_);
       } elsif(defined($fh_rerr) && (fileno($fh) == fileno($fh_rerr))) {
-        &$right_stderr_filter if($right_stderr_filter);
+        &$right_stderr_filter($right_name) if($right_stderr_filter);
         ERROR "[$right_name] $_" if($_);
       } else {
         die "unexpected filehandle from select()";
@@ -949,7 +949,8 @@ sub btrfs_subvolume_delete($@)
   DEBUG "[btrfs]   subvolume: $_->{PRINT}" foreach(@$targets);
   my @options;
   @options = ("--commit-$commit") if($commit);
-  my $ret = run_cmd(cmd => [ qw(btrfs subvolume delete), @options,  map( { "'$_->{PATH}'" } @$targets) ],
+  my @target_paths = map( { "'$_->{PATH}'" } @$targets);
+  my $ret = run_cmd(cmd => [ qw(btrfs subvolume delete), @options, @target_paths ],
                     rsh => $rsh,
                    );
   ERROR "Failed to delete btrfs subvolumes: " . join(' ', map( { $_->{PRINT} } @$targets)) unless(defined($ret));
@@ -977,16 +978,43 @@ sub btrfs_send_receive($$$)
   DEBUG "[btrfs]   parent: $parent->{PRINT}" if($parent);
   DEBUG "[btrfs]   target: $target->{PRINT}";
 
-  my @parent_option;
-  my @receive_option;
-  @parent_option =  ('-p', $parent_path) if($parent_path);
-  @receive_option = ('-v') if($loglevel >= 3);
+  my @send_options;
+  my @receive_options;
+  push(@send_options, '-p', $parent_path) if($parent_path);
+  push(@send_options, '-v') if($loglevel >= 3);
+  push(@receive_options, '-v') if($loglevel >= 3);
 
-  my $ret = run_cmd(cmd => [ qw(btrfs send), @parent_option, $snapshot_path ],
+  my $filter_stderr = sub {
+    my $name = shift;
+    if(s/^ERROR: //) {
+      ERROR "[$name] $_";
+      $_ = undef;  # consume stderr line
+    }
+    elsif(s/^WARNING: //) {
+      WARN "[$name] $_";
+      $_ = undef;  # consume stderr line
+    }
+    elsif(/^At subvol/) {
+      INFO "[$name] $_";
+      $_ = undef;  # consume stderr line
+    }
+    elsif($loglevel >= 3) {
+      # treat all others as debug messages, those should only be printed if '-v' option is passed
+      DEBUG "[$name] $_";
+      $_ = undef;  # consume stderr line
+    }
+  };
+
+  my $ret = run_cmd(cmd => [ qw(btrfs send), @send_options, $snapshot_path ],
                     rsh => $snapshot_rsh,
+                    name => "btrfs send",
+                    filter_stderr => $filter_stderr,
+
                     pipe => {
-                      cmd => [ qw(btrfs receive), @receive_option, $target_path . '/' ],
+                      cmd => [ qw(btrfs receive), @receive_options, $target_path . '/' ],
                       rsh => $target_rsh,
+                      name => "btrfs receive",
+                      filter_stderr => $filter_stderr,
                      },
                    );
   unless(defined($ret)) {
