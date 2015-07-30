@@ -1380,7 +1380,7 @@ MAIN:
   my @today = Today();
 
   my %opts;
-  unless(getopts('hc:prvql:', \%opts)) {
+  unless(getopts('hc:prvqlt:', \%opts)) {
     VERSION_MESSAGE();
     HELP_MESSAGE(0);
     exit 1;
@@ -1401,7 +1401,12 @@ MAIN:
   my $quiet = $opts{q};
   my $preserve_backups = $opts{p};
   my $resume_only = $opts{r};
-
+  
+  if($opts{t} && $opts{t} =~ /^([0-9]+).([0-9]+).([0-9]+)$/){
+		my ($day,$month,$year) = ($1,$2,$3);
+		@today = ($year,$month,$day);
+	}
+	
   # check command line options
   if($opts{h} || (not $command)) {
     VERSION_MESSAGE();
