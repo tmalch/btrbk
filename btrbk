@@ -76,7 +76,9 @@ my %config_options = (
   ssh_identity              => { default => undef,    accept_file => { absolute => 1 } },
   ssh_user                  => { default => "root",   accept_regexp => qr/^[a-z_][a-z0-9_-]*$/ },
   btrfs_progs_compat        => { default => undef,    accept => [ "yes", "no" ] },
-
+	
+	snapshot_qgroud_id        => { default => undef,    accept => [ "all" ], accept_regexp => qr/^1\/[0-9]*$/ },
+  
   # deprecated options
   snapshot_create_always    => { default => undef, accept => [ "yes", "no" ],
                                  deprecated => { yes => { warn => "Please use \"snapshot_create always\"",
@@ -824,6 +826,20 @@ sub btrfs_subvolume_snapshot($$)
   return defined($ret) ? $target_path : undef;
 }
 
+sub btrfs_qgroup_assign($$)
+{
+	my $snapshot = shift || die;
+	my $dst_qgroupid = shift // die;
+	my $rsh = $snapshot->{RSH} || "";
+	
+	my $snapshot_detail = btrfs_subvolume_detail($snapshot);
+	return undef unless $snapshot_detail;
+	my $snapshot_qgroupid = "0/$snapshot_detail->{id}";
+	DEBUG "[btrfs] qgroup assign: $snapshot->{SUBVOL_PATH} with qgroupid $snapshot_qgroupid to qgroup with id $dst_qgroupid";
+	my $ret = run_cmd("$rsh btrfs qgroup assign '$snapshot_qgroupid' '$dst_qgroupid' '$snapshot->{PATH}'");
+	ERROR "Failed to assign btrfs snapshot $snapshot->{SUBVOL_PATH} to qgroup $dst_qgroupid" unless(defined($ret));
+	return defined($ret) ? "success" : undef;
+}
 
 sub btrfs_subvolume_delete($@)
 {
@@ -1579,6 +1595,7 @@ MAIN:
   # parse config file
   #
   my $config = parse_config(@config_src);
+
   unless($config) {
     ERROR "Failed to parse configuration file";
     exit 1;
@@ -1587,8 +1604,7 @@ MAIN:
     ERROR "No volumes defined in configuration file";
     exit 1;
   }
-
-
+	
   #
   # filter subvolumes matching command line arguments
   #
@@ -1767,7 +1783,7 @@ MAIN:
       }
     }
   }
-
+	
 
   if($action_origin)
   {
@@ -1963,6 +1979,16 @@ MAIN:
           INFO "Creating subvolume snapshot for: $svol->{PRINT}";
           if(btrfs_subvolume_snapshot($svol, "$sroot->{PATH}/$snapdir/$snapshot_name")) {
             $config_subvol->{SNAPSHOT} = vinfo_child($sroot, "$snapdir/$snapshot_name");
+          	
+          	my $qgroupid = config_key($config, "snapshot_qgroud_id");
+						if($qgroupid){
+							my $snapshot = $config_subvol->{SNAPSHOT};
+							if(btrfs_qgroup_assign($snapshot,$qgroupid)){
+								print "sccessful assigned qgroup to $snapshot->{SUBVOL_PATH}\n";
+							}else{
+								print "error happend while assigning qgroup to new snapshot $snapshot->{SUBVOL_PATH}\n";
+							}
+						}
           }
           else {
             $config_subvol->{ABORTED} = "Failed to create snapshot: $svol->{PRINT} -> $sroot->{PRINT}/$snapdir/$snapshot_name";
@@ -2283,7 +2309,7 @@ MAIN:
                     ],
                   );
       print join("\n", @out);
-
+	
       if($resume_only) {
         print "\nNOTE: No snapshots created (option -r present)\n";
       }
@@ -2297,6 +2323,9 @@ MAIN:
       }
       if($dryrun) {
         print "\nNOTE: Dryrun was active, none of the operations above were actually executed!\n";
+      }
+      if($err_count) {
+      	exit 1
       }
     }
   }
