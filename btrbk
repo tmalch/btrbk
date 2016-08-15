@@ -645,7 +645,7 @@ sub btrfs_subvolume_detail($)
   }
   my %detail = ( REAL_PATH  => $real_path );
 
-  if($ret eq "$real_path is btrfs root") {
+  if($ret eq "$real_path is toplevel subvolume") {
     DEBUG "found btrfs root: $vol->{PRINT}";
     $detail{id}      = 5;
     $detail{is_root} = 1;
